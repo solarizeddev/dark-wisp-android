@@ -846,15 +846,7 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
 
         profileFollowersJob = viewModelScope.launch {
             val working = LinkedHashSet<String>()
-            var archivesEose = false
-            val archives = launch {
-                archivesEose = loadFollowersFromArchives(pool, pubkey, gen, working, liveUpdate)
-            }
-            val contactLists = launch {
-                loadFollowersFromContactLists(pool, pubkey, gen, working)
-            }
-            archives.join()
-            contactLists.join()
+            val anyRelayAnswered = loadFollowersFromContactLists(pool, pubkey, gen, working, liveUpdate)
             if (profileFollowersGen != gen) return@launch
 
             // Union this run into the cache — a run that hit slow relays must
@@ -866,10 +858,10 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                 _followers.value = resolveFollowerProfiles(merged)
                 _followersError.value = false
             } else {
-                // Failure only when nothing was ever found AND the archives
-                // endpoint never finished responding; an explicit empty EOSE
-                // stays the regular empty state
-                _followersError.value = _followers.value.isEmpty() && !archivesEose
+                // Failure only when nothing was found AND no relay finished
+                // responding; relays that answered with nothing stay the
+                // regular empty state
+                _followersError.value = _followers.value.isEmpty() && !anyRelayAnswered
             }
             _followersLoading.value = false
         }
@@ -885,80 +877,19 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
 
-    /** Followers list from the archives feed endpoint. True when it EOSE'd. */
-    private suspend fun loadFollowersFromArchives(
+    /**
+     * Follower pubkeys from kind 3 contact lists held by the profile's own
+     * relays and the pool (a community relay that mirrors its members'
+     * followers serves these locally). Fully decentralized — no fixed index
+     * endpoint. Returns true when at least one relay finished responding.
+     */
+    private suspend fun loadFollowersFromContactLists(
         pool: RelayPool,
         pubkey: String,
         gen: Int,
         working: MutableSet<String>,
         liveUpdate: Boolean
     ): Boolean {
-        val subId = "profile-followers-$gen"
-        val filter = Filter(kinds = listOf(0), authors = listOf(pubkey), limit = 500)
-        val url = "wss://feeds.nostrarchives.com/profiles/followers"
-
-        // Collector and EOSE watch start before the first send — the endpoint
-        // can answer while the connect loop is still polling, and anything
-        // emitted before subscribing would be lost
-        var got = 0
-        val collectJob = viewModelScope.launch {
-            pool.relayEvents.collect { (event, _, subscriptionId) ->
-                if (subscriptionId != subId) return@collect
-                if (profileFollowersGen != gen) return@collect
-                if (event.kind == 0 && working.add(event.pubkey)) {
-                    eventRepoRef?.cacheEvent(event)
-                    got++
-                    if (liveUpdate) {
-                        ProfileData.fromEvent(event)?.let { _followers.value = _followers.value + it }
-                    }
-                }
-            }
-        }
-        val eoseSeen = CompletableDeferred<Unit>()
-        val eoseWatch = viewModelScope.launch {
-            pool.eoseDetails.first { it.first == subId && it.second == url }
-            eoseSeen.complete(Unit)
-        }
-        var gotEose = false
-        try {
-            var connected = false
-            for (attempt in 0..2) {
-                if (profileFollowersGen != gen) return false
-                if (attempt > 0) { pool.disconnectRelay(url); delay(1500L) }
-                pool.sendToRelayOrEphemeral(url, ClientMessage.req(subId, filter), skipBadCheck = true)
-                val deadline = System.currentTimeMillis() + 5_000
-                while (System.currentTimeMillis() < deadline) {
-                    if (profileFollowersGen != gen) return false
-                    if (pool.isRelayConnected(url)) { connected = true; break }
-                    delay(200)
-                }
-                if (connected) break
-            }
-            if (!connected) {
-                Log.d("UserProfileVM", "followers: archives endpoint never connected")
-                return false
-            }
-            gotEose = withTimeoutOrNull(15_000) { eoseSeen.await() } != null
-        } finally {
-            collectJob.cancel()
-            eoseWatch.cancel()
-            pool.closeOnAllRelays(subId)
-        }
-        Log.d("UserProfileVM", "followers: archives eose=$gotEose got=$got")
-        return gotEose
-    }
-
-    /**
-     * Follower pubkeys from kind 3 contact lists held by the profile's own
-     * relays and the pool (a community relay that mirrors its members'
-     * followers serves these locally).
-     */
-    private suspend fun loadFollowersFromContactLists(
-        pool: RelayPool,
-        pubkey: String,
-        gen: Int,
-        working: MutableSet<String>
-    ) {
         val relays = profileRelayCandidates(pubkey)
         val k3SubId = "profile-followers-k3-$gen"
         // Whale guard: contact-list events are large, so stop the subscription
@@ -968,12 +899,21 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
             pool.relayEvents.collect { (event, _, subscriptionId) ->
                 if (subscriptionId != k3SubId) return@collect
                 if (profileFollowersGen != gen) return@collect
-                if (event.kind == 3 && working.add(event.pubkey) &&
-                    working.size >= FollowerRepository.MAX_FOLLOWERS_PER_PROFILE
-                ) {
+                if (event.kind != 3 || !working.add(event.pubkey)) return@collect
+                // First visit renders rows as they are found; refreshes under a
+                // cached list land as one update at the end
+                if (liveUpdate) {
+                    _followers.value = _followers.value + resolveFollowerProfiles(listOf(event.pubkey))
+                }
+                if (working.size >= FollowerRepository.MAX_FOLLOWERS_PER_PROFILE) {
                     capReached.complete(Unit)
                 }
             }
+        }
+        var anyEose = false
+        val eoseWatch = viewModelScope.launch {
+            pool.eoseDetails.first { it.first == k3SubId }
+            anyEose = true
         }
         try {
             val filter = Filter(kinds = listOf(3), pTags = listOf(pubkey), limit = 500)
@@ -990,9 +930,11 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
             awaitSubDone(pool, awaiting, 10_000, capReached)
         } finally {
             k3Collect.cancel()
+            eoseWatch.cancel()
             pool.closeOnAllRelays(k3SubId)
         }
-        Log.d("UserProfileVM", "followers: k3 done, total found=${working.size}")
+        Log.d("UserProfileVM", "followers: k3 done, total found=${working.size} anyEose=$anyEose")
+        return anyEose || working.isNotEmpty()
     }
 
     /** Fetch kind 0 profiles for any pubkeys not in the event cache yet. */
