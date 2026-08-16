@@ -188,7 +188,7 @@ class ExtendedNetworkRepository(
                     }
                 }
 
-                val sentCount = relayPool.sendToTopRelays(msg, maxRelays = 15)
+                val sentCount = relayPool.sendToTopRelays(msg, maxRelays = 15).size
                 val eoseDeferred = async {
                     subManager.awaitEoseCount(subId, sentCount, FOLLOW_LIST_TIMEOUT_MS)
                 }
@@ -321,7 +321,7 @@ class ExtendedNetworkRepository(
                         val rlSubId = "extnet-rl-$i"
                         rlSubIds.add(rlSubId)
                         val filter = Filter(kinds = listOf(10002), authors = chunk)
-                        val sent = relayPool.sendToTopRelays(ClientMessage.req(rlSubId, filter), maxRelays = 10)
+                        val sent = relayPool.sendToTopRelays(ClientMessage.req(rlSubId, filter), maxRelays = 10).size
                         sentCounts.add(rlSubId to sent)
                     }
 

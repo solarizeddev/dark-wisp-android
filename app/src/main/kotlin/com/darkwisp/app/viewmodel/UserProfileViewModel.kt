@@ -961,11 +961,18 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
     ) {
         val relays = profileRelayCandidates(pubkey)
         val k3SubId = "profile-followers-k3-$gen"
+        // Whale guard: contact-list events are large, so stop the subscription
+        // the moment the cap is reached instead of draining every relay
+        val capReached = CompletableDeferred<Unit>()
         val k3Collect = viewModelScope.launch {
             pool.relayEvents.collect { (event, _, subscriptionId) ->
                 if (subscriptionId != k3SubId) return@collect
                 if (profileFollowersGen != gen) return@collect
-                if (event.kind == 3) working.add(event.pubkey)
+                if (event.kind == 3 && working.add(event.pubkey) &&
+                    working.size >= FollowerRepository.MAX_FOLLOWERS_PER_PROFILE
+                ) {
+                    capReached.complete(Unit)
+                }
             }
         }
         try {
@@ -980,7 +987,7 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
             }
             pool.sendToAll(k3Msg).forEach { awaiting.add(k3SubId to it) }
             Log.d("UserProfileVM", "followers: k3 queried=${awaiting.size} relays")
-            awaitSubDone(pool, awaiting, 10_000)
+            awaitSubDone(pool, awaiting, 10_000, capReached)
         } finally {
             k3Collect.cancel()
             pool.closeOnAllRelays(k3SubId)
@@ -1009,7 +1016,9 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
             missing.chunked(50).forEachIndexed { index, batch ->
                 val sub = if (index == 0) k0SubId else "$k0SubId-$index"
                 val msg = ClientMessage.req(sub, Filter(kinds = listOf(0), authors = batch, limit = batch.size))
-                pool.sendToAll(msg).forEach { awaiting.add(sub to it) }
+                // Bounded relay slice + indexers — a full pool broadcast per
+                // chunk explodes into hundreds of REQs on whale profiles
+                pool.sendToTopRelays(msg, maxRelays = 8).forEach { awaiting.add(sub to it) }
                 for (url in RelayConfig.DEFAULT_INDEXER_RELAYS) {
                     if (pool.sendToRelayOrEphemeral(url, msg)) awaiting.add(sub to url)
                 }

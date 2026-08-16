@@ -19,8 +19,8 @@ class FollowerRepository {
     private val cache = LruCache<String, Entry>(30)
 
     companion object {
-        /** Bound per-profile memory; matches the per-relay query limit. */
-        private const val MAX_FOLLOWERS_PER_PROFILE = 1000
+        /** Bound per-profile memory and per-visit relay work for whale profiles. */
+        const val MAX_FOLLOWERS_PER_PROFILE = 1000
 
         /** A refresh newer than this is not worth repeating on tab re-entry. */
         const val FRESH_WINDOW_MS = 60_000L

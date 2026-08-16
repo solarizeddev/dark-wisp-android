@@ -881,12 +881,12 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
      * Send to only the first [maxRelays] connected relays (prioritizing pinned relays).
      * Used for metadata fetches where full broadcast is wasteful.
      */
-    fun sendToTopRelays(message: String, maxRelays: Int = 10): Int {
+    fun sendToTopRelays(message: String, maxRelays: Int = 10): List<String> {
         val subId = extractSubId(message)
-        var sentCount = 0
+        val sentTo = mutableListOf<String>()
         // Send to pinned relays first
         for (relay in relays) {
-            if (sentCount >= maxRelays) break
+            if (sentTo.size >= maxRelays) break
             if (relay.config.url in pinnedRelayUrls && relay.isConnected) {
                 if (subId != null) {
                     if (!subscriptionTracker.hasCapacity(relay.config.url, subId)) continue
@@ -894,12 +894,12 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
                     trackSubscription(relay.config.url, subId, message)
                 }
                 relay.send(message)
-                sentCount++
+                sentTo.add(relay.config.url)
             }
         }
         // Fill remaining slots with other connected relays
         for (relay in relays) {
-            if (sentCount >= maxRelays) break
+            if (sentTo.size >= maxRelays) break
             if (relay.config.url !in pinnedRelayUrls && relay.isConnected) {
                 if (subId != null) {
                     if (!subscriptionTracker.hasCapacity(relay.config.url, subId)) continue
@@ -907,14 +907,14 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
                     trackSubscription(relay.config.url, subId, message)
                 }
                 relay.send(message)
-                sentCount++
+                sentTo.add(relay.config.url)
             }
         }
         if (subId != null) {
             logSubStart(subId, message)
-            Log.d("RLC", "[Pool] sendToTopRelays sub=$subId → $sentCount/$maxRelays relays")
+            Log.d("RLC", "[Pool] sendToTopRelays sub=$subId → ${sentTo.size}/$maxRelays relays")
         }
-        return sentCount
+        return sentTo
     }
 
     fun sendToRelay(url: String, message: String) {
