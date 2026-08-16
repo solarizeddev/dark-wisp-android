@@ -10,6 +10,7 @@ import com.darkwisp.app.nostr.Nip02
 import com.darkwisp.app.nostr.Nip10
 import com.darkwisp.app.nostr.Nip51
 import com.darkwisp.app.nostr.Nip65
+import com.darkwisp.app.nostr.Nip85
 import com.darkwisp.app.nostr.NipA3
 import com.darkwisp.app.nostr.SimpleGroupEntry
 import com.darkwisp.app.nostr.LocalSigner
@@ -119,6 +120,15 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
     private val _followersLoading = MutableStateFlow(false)
     val followersLoading: StateFlow<Boolean> = _followersLoading
 
+    private val _followersError = MutableStateFlow(false)
+    val followersError: StateFlow<Boolean> = _followersError
+
+    private val _followerCount = MutableStateFlow<Int?>(null)
+    val followerCount: StateFlow<Int?> = _followerCount
+
+    private val _followerCountSource = MutableStateFlow<String?>(null)
+    val followerCountSource: StateFlow<String?> = _followerCountSource
+
     private val _galleryPosts = MutableStateFlow<List<NostrEvent>>(emptyList())
     val galleryPosts: StateFlow<List<NostrEvent>> = _galleryPosts
 
@@ -148,6 +158,8 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
     private var profileFeedNotesJob: Job? = null
     private var profileFeedRepliesJob: Job? = null
     private var profileFollowersJob: Job? = null
+    private var followerCountJob: Job? = null
+    private var followerCountGen = 0
     // Track oldest event timestamps from the target user (kind 1/6) for pagination.
     // rootNotes contains repost inner events with different authors/timestamps,
     // so we track the user's own event timestamps separately.
@@ -194,6 +206,9 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         _sortedRepliesLoading.value = false
         _followers.value = emptyList()
         _followersLoading.value = false
+        _followersError.value = false
+        _followerCount.value = null
+        _followerCountSource.value = null
         _galleryPosts.value = emptyList()
         _groups.value = emptyList()
         _groupsLoading.value = false
@@ -264,6 +279,9 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         for (url in RelayConfig.DEFAULT_INDEXER_RELAYS) {
             relayPool.sendToRelayOrEphemeral(url, ClientMessage.req("usergroups", groupsFilter))
         }
+
+        // NIP-85 follower count assertion
+        loadFollowerCount(relayPool)
 
         // After posts EOSE, subscribe for engagement data
         if (subManager != null) {
@@ -530,6 +548,8 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         profileFeedRepliesJob = null
         profileFollowersJob?.cancel()
         profileFollowersJob = null
+        followerCountJob?.cancel()
+        followerCountJob = null
     }
 
     override fun onCleared() {
@@ -617,6 +637,80 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * NIP-85 follower count: read the profile's kind 10040 to find the assertion
+     * provider they trust for follower counts, then fetch that provider's kind
+     * 30382 assertion about them. Falls back to the default provider relay when
+     * no kind 10040 exists.
+     */
+    private fun loadFollowerCount(pool: RelayPool) {
+        followerCountJob?.cancel()
+        followerCountGen++
+        val gen = followerCountGen
+        val pubkey = targetPubkey
+        val providerSubId = "nip85-provider-$gen"
+        val assertionSubId = "nip85-followers-$gen"
+        followerCountJob = viewModelScope.launch {
+            try {
+                var providerList: NostrEvent? = null
+                val providerCollect = launch {
+                    pool.relayEvents.collect { (event, _, subscriptionId) ->
+                        if (subscriptionId != providerSubId) return@collect
+                        if (event.kind != Nip85.KIND_PROVIDER_LIST || event.pubkey != pubkey) return@collect
+                        if (event.created_at > (providerList?.created_at ?: 0L)) providerList = event
+                    }
+                }
+                val providerFilter = Filter(kinds = listOf(Nip85.KIND_PROVIDER_LIST), authors = listOf(pubkey), limit = 1)
+                val router = outboxRouterRef
+                if (router != null) {
+                    router.subscribeToUserWriteRelays(providerSubId, pubkey, providerFilter)
+                } else {
+                    pool.sendToAll(ClientMessage.req(providerSubId, providerFilter))
+                }
+                for (url in RelayConfig.DEFAULT_INDEXER_RELAYS) {
+                    pool.sendToRelayOrEphemeral(url, ClientMessage.req(providerSubId, providerFilter))
+                }
+                withTimeoutOrNull(6_000) { pool.eoseSignals.first { it == providerSubId } }
+                // First EOSE may come from a relay without the event — grace for stragglers
+                delay(1_000)
+                providerCollect.cancel()
+                pool.closeOnAllRelays(providerSubId)
+
+                val provider = providerList?.let { Nip85.parseProvider(it, Nip85.ASSERTION_FOLLOWERS) }
+                val relayUrl = provider?.relayHint ?: Nip85.DEFAULT_PROVIDER_RELAY
+
+                var latestAssertion = 0L
+                val assertionCollect = launch {
+                    pool.relayEvents.collect { (event, _, subscriptionId) ->
+                        if (subscriptionId != assertionSubId) return@collect
+                        if (followerCountGen != gen) return@collect
+                        // Without a kind 10040 there is no user-chosen provider; trust
+                        // the default provider relay to serve its operator's assertions
+                        if (provider != null && event.pubkey != provider.pubkey) return@collect
+                        val count = Nip85.parseFollowerCount(event, pubkey) ?: return@collect
+                        if (event.created_at > latestAssertion) {
+                            latestAssertion = event.created_at
+                            _followerCount.value = count
+                            _followerCountSource.value = relayUrl.removePrefix("wss://").removePrefix("ws://").trimEnd('/')
+                        }
+                    }
+                }
+                val assertionFilter = Filter(
+                    kinds = listOf(Nip85.KIND_ASSERTION),
+                    authors = provider?.let { listOf(it.pubkey) },
+                    dTags = listOf(pubkey),
+                    limit = 1
+                )
+                pool.sendToRelayOrEphemeral(relayUrl, ClientMessage.req(assertionSubId, assertionFilter), skipBadCheck = true)
+                withTimeoutOrNull(10_000) { pool.eoseSignals.first { it == assertionSubId } }
+                assertionCollect.cancel()
+            } finally {
+                pool.closeOnAllRelays(providerSubId)
+                pool.closeOnAllRelays(assertionSubId)
+            }
+        }
+    }
+
     fun loadFollowers() {
         val pool = relayPoolRef ?: return
         if (_followersLoading.value && _followers.value.isNotEmpty()) return
@@ -624,6 +718,7 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         profileFollowersJob?.cancel()
         _followers.value = emptyList()
         _followersLoading.value = true
+        _followersError.value = false
 
         val pubkey = targetPubkey
         profileFollowersGen++
@@ -646,7 +741,13 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 if (connected) break
             }
-            if (!connected) { _followersLoading.value = false; return@launch }
+            if (!connected) {
+                // Endpoint down, blocked, or in cooldown — distinct from a profile
+                // that genuinely has no followers
+                _followersError.value = true
+                _followersLoading.value = false
+                return@launch
+            }
 
             val seenPubkeys = mutableSetOf<String>()
             val collectJob = launch {

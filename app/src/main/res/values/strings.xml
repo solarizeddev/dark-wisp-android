@@ -681,6 +681,7 @@
     <string name="profile_no_media">No media yet</string>
     <string name="profile_not_following">Not following anyone</string>
     <string name="profile_no_followers">No followers found</string>
+    <string name="profile_followers_error">Couldn\'t reach the follower service. Try again later.</string>
     <string name="profile_no_groups">No chat rooms</string>
     <string name="profile_no_relays">No relay list published</string>
     <string name="profile_relay_list">Relay List (NIP-65)</string>

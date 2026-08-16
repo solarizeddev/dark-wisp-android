@@ -426,6 +426,9 @@ fun UserProfileScreen(
     val sortedRepliesLoading by viewModel.sortedRepliesLoading.collectAsState()
     val followers by viewModel.followers.collectAsState()
     val followersLoading by viewModel.followersLoading.collectAsState()
+    val followersError by viewModel.followersError.collectAsState()
+    val followerCount by viewModel.followerCount.collectAsState()
+    val followerCountSource by viewModel.followerCountSource.collectAsState()
     val groups by viewModel.groups.collectAsState()
     val groupsLoading by viewModel.groupsLoading.collectAsState()
 
@@ -620,6 +623,8 @@ fun UserProfileScreen(
                     isWalletConnected = isWalletConnected,
                     onLightningPay = { showLightningSheet = true },
                     followingCount = followList.size,
+                    followerCount = followerCount,
+                    followerCountSource = followerCountSource,
                     followedBy = followedBy,
                     followsYou = !isOwnProfile && userPubkey != null && followList.any { it.pubkey == userPubkey },
                     isBlocked = isBlocked,
@@ -1123,7 +1128,14 @@ fun UserProfileScreen(
                             }
                         }
                     } else if (followers.isEmpty()) {
-                        item { EmptyTabContent(stringResource(R.string.profile_no_followers)) }
+                        item {
+                            EmptyTabContent(
+                                stringResource(
+                                    if (followersError) R.string.profile_followers_error
+                                    else R.string.profile_no_followers
+                                )
+                            )
+                        }
                     } else {
                         items(items = followers, key = { it.pubkey }) { followerProfile ->
                             FollowerRow(
@@ -1207,6 +1219,8 @@ private fun ProfileHeader(
     isWalletConnected: Boolean = false,
     onLightningPay: (() -> Unit)? = null,
     followingCount: Int = 0,
+    followerCount: Int? = null,
+    followerCountSource: String? = null,
     followedBy: List<String> = emptyList(),
     followsYou: Boolean = false,
     isBlocked: Boolean = false,
@@ -1553,8 +1567,9 @@ private fun ProfileHeader(
             }
         }
 
-        // Following / Followers in your network counts
-        if (followingCount > 0 || followedBy.isNotEmpty()) {
+        // Following / Followers counts — follower count comes from a NIP-85
+        // assertion, so label where it came from
+        if (followingCount > 0 || followerCount != null) {
             Spacer(Modifier.height(10.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (followingCount > 0) {
@@ -1570,22 +1585,40 @@ private fun ProfileHeader(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                if (followingCount > 0 && followedBy.isNotEmpty()) {
-                    Spacer(Modifier.width(16.dp))
-                }
-                if (followedBy.isNotEmpty()) {
+                if (followerCount != null) {
+                    if (followingCount > 0) {
+                        Spacer(Modifier.width(16.dp))
+                    }
                     Text(
-                        text = "${followedBy.size}",
+                        text = "$followerCount",
                         style = MaterialTheme.typography.titleSmall,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Spacer(Modifier.width(3.dp))
                     Text(
-                        text = "Followers in your network",
+                        text = if (followerCountSource != null) "Followers · $followerCountSource" else "Followers",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+            }
+        }
+
+        // Followers in your network count
+        if (followedBy.isNotEmpty()) {
+            Spacer(Modifier.height(if (followingCount > 0 || followerCount != null) 6.dp else 10.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "${followedBy.size}",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(Modifier.width(3.dp))
+                Text(
+                    text = "Followers in your network",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
 
