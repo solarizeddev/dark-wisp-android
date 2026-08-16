@@ -947,8 +947,13 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                     pool.sendToRelayOrEphemeral(relay, ClientMessage.req(sub, profileFilter), skipBadCheck = true)
                 }
             }
-            withTimeoutOrNull(10_000) { pool.eoseSignals.first { it == k0SubId } }
-            delay(1_000)
+            // Wait until every pending profile resolves or the window closes —
+            // the first EOSE lands long before slower relays deliver their
+            // kind 0s, so it is useless as a stop signal here
+            withTimeoutOrNull(12_000) {
+                while (wanted.isNotEmpty()) delay(250)
+            }
+            Log.d("UserProfileVM", "followers: k0 fetch unresolved=${wanted.size} of ${uncached.size}")
         } finally {
             k0Collect.cancel()
             pool.closeOnAllRelays(k0SubId)
