@@ -765,10 +765,16 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             val sm = subManagerRef
-            if (sm != null) sm.awaitEoseCount(subId, 1)
-            else withTimeoutOrNull(15_000) { pool.eoseSignals.first { it == subId } }
+            val gotEose = if (sm != null) sm.awaitEoseCount(subId, 1) > 0
+            else withTimeoutOrNull(15_000) { pool.eoseSignals.first { it == subId } } != null
             collectJob.cancel()
             pool.closeOnAllRelays(subId)
+            // Connected but the endpoint never finished responding — that's a
+            // failure, not a profile with no followers. An explicit empty EOSE
+            // still shows the regular empty state.
+            if (!gotEose && _followers.value.isEmpty() && profileFollowersGen == gen) {
+                _followersError.value = true
+            }
             _followersLoading.value = false
         }
     }
