@@ -649,7 +649,6 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         val gen = followerCountGen
         val pubkey = targetPubkey
         val providerSubId = "nip85-provider-$gen"
-        val assertionSubId = "nip85-followers-$gen"
         followerCountJob = viewModelScope.launch {
             try {
                 var providerList: NostrEvent? = null
@@ -677,38 +676,71 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                 pool.closeOnAllRelays(providerSubId)
 
                 val provider = providerList?.let { Nip85.parseProvider(it, Nip85.ASSERTION_FOLLOWERS) }
-                val relayUrl = provider?.relayHint ?: Nip85.DEFAULT_PROVIDER_RELAY
+                Log.d("UserProfileVM", "nip85: 10040=${providerList != null} provider=${provider?.pubkey?.take(8)} hint=${provider?.relayHint}")
 
-                var latestAssertion = 0L
-                val assertionCollect = launch {
-                    pool.relayEvents.collect { (event, _, subscriptionId) ->
-                        if (subscriptionId != assertionSubId) return@collect
-                        if (followerCountGen != gen) return@collect
-                        // Without a kind 10040 there is no user-chosen provider; trust
-                        // the default provider relay to serve its operator's assertions
-                        if (provider != null && event.pubkey != provider.pubkey) return@collect
-                        val count = Nip85.parseFollowerCount(event, pubkey) ?: return@collect
-                        if (event.created_at > latestAssertion) {
-                            latestAssertion = event.created_at
-                            _followerCount.value = count
-                            _followerCountSource.value = relayUrl.removePrefix("wss://").removePrefix("ws://").trimEnd('/')
+                // The profile's chosen provider first, then the defaults
+                val candidates = buildList {
+                    if (provider != null) {
+                        if (provider.relayHint != null) {
+                            add(Nip85.ProviderRelay(provider.pubkey, provider.relayHint))
+                        } else {
+                            for (dp in Nip85.DEFAULT_PROVIDERS) add(Nip85.ProviderRelay(provider.pubkey, dp.relay))
                         }
                     }
+                    for (dp in Nip85.DEFAULT_PROVIDERS) {
+                        if (none { it.pubkey == dp.pubkey && it.relay == dp.relay }) add(dp)
+                    }
                 }
-                val assertionFilter = Filter(
-                    kinds = listOf(Nip85.KIND_ASSERTION),
-                    authors = provider?.let { listOf(it.pubkey) },
-                    dTags = listOf(pubkey),
-                    limit = 1
-                )
-                pool.sendToRelayOrEphemeral(relayUrl, ClientMessage.req(assertionSubId, assertionFilter), skipBadCheck = true)
-                withTimeoutOrNull(10_000) { pool.eoseSignals.first { it == assertionSubId } }
-                assertionCollect.cancel()
+                for ((index, candidate) in candidates.withIndex()) {
+                    if (followerCountGen != gen) return@launch
+                    if (fetchFollowerAssertion(pool, "nip85-followers-$gen-$index", candidate, pubkey, gen)) break
+                }
             } finally {
                 pool.closeOnAllRelays(providerSubId)
-                pool.closeOnAllRelays(assertionSubId)
             }
         }
+    }
+
+    /** Query one relay for a kind 30382 follower assertion. True when a count was found. */
+    private suspend fun fetchFollowerAssertion(
+        pool: RelayPool,
+        subId: String,
+        candidate: Nip85.ProviderRelay,
+        pubkey: String,
+        gen: Int
+    ): Boolean {
+        var found = false
+        val collectJob = viewModelScope.launch {
+            pool.relayEvents.collect { (event, _, subscriptionId) ->
+                if (subscriptionId != subId) return@collect
+                if (followerCountGen != gen) return@collect
+                if (candidate.pubkey != null && event.pubkey != candidate.pubkey) return@collect
+                val count = Nip85.parseFollowerCount(event, pubkey) ?: return@collect
+                found = true
+                _followerCount.value = count
+                _followerCountSource.value = candidate.relay.removePrefix("wss://").removePrefix("ws://").trimEnd('/')
+            }
+        }
+        try {
+            val filter = Filter(
+                kinds = listOf(Nip85.KIND_ASSERTION),
+                authors = candidate.pubkey?.let { listOf(it) },
+                dTags = listOf(pubkey),
+                limit = 1
+            )
+            val sent = pool.sendToRelayOrEphemeral(candidate.relay, ClientMessage.req(subId, filter), skipBadCheck = true)
+            Log.d("UserProfileVM", "nip85: query ${candidate.relay} author=${candidate.pubkey?.take(8) ?: "any"} sent=$sent")
+            if (sent) {
+                withTimeoutOrNull(8_000) { pool.eoseSignals.first { it == subId } }
+                // The matching EVENT can still be in flight when EOSE lands
+                delay(250)
+            }
+        } finally {
+            collectJob.cancel()
+            pool.closeOnAllRelays(subId)
+        }
+        Log.d("UserProfileVM", "nip85: ${candidate.relay} -> found=$found")
+        return found
     }
 
     fun loadFollowers() {

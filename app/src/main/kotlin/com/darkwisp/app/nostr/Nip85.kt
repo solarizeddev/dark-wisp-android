@@ -15,10 +15,20 @@ object Nip85 {
     /** Assertion tag name for follower counts in kind 30382 events. */
     const val ASSERTION_FOLLOWERS = "followers"
 
-    /** Relay queried for assertions when the user has no kind 10040. */
-    const val DEFAULT_PROVIDER_RELAY = "wss://nip85.nostr.band"
-
     data class Provider(val pubkey: String, val relayHint: String?)
+
+    /** A relay to query for assertions; a non-null pubkey pins the accepted author. */
+    data class ProviderRelay(val pubkey: String?, val relay: String)
+
+    /** Tried in order when the profile's kind 10040 is absent or yields nothing. */
+    val DEFAULT_PROVIDERS = listOf(
+        // stack.solar community provider — relay-cards bot, cards live only on this relay
+        ProviderRelay(
+            "927f57b04121d7988e4febebad5226a016c44ddb946f90729f7be5d15b800f28",
+            "wss://relay.stack.solar"
+        ),
+        ProviderRelay(null, "wss://nip85.nostr.band")
+    )
 
     /** Provider the user trusts for [assertion] (e.g. "followers") per their kind 10040. */
     fun parseProvider(event: NostrEvent, assertion: String): Provider? {
