@@ -24,6 +24,7 @@ import com.darkwisp.app.repo.ContactRepository
 import com.darkwisp.app.repo.EventRepository
 import com.darkwisp.app.repo.DiscoveryState
 import com.darkwisp.app.repo.ExtendedNetworkRepository
+import com.darkwisp.app.repo.FollowerRepository
 import com.darkwisp.app.repo.KeyRepository
 import com.darkwisp.app.repo.PaymentTargetRepository
 import com.darkwisp.app.repo.RelayHintStore
@@ -147,6 +148,7 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
     private var relayHintStoreRef: RelayHintStore? = null
     private var relayListRepoRef: RelayListRepository? = null
     private var paymentTargetRepoRef: PaymentTargetRepository? = null
+    private var followerRepoRef: FollowerRepository? = null
     private val activeEngagementSubIds = mutableListOf<String>()
     private val activeFollowProfileSubIds = mutableListOf<String>()
     private var topRelayUrls: List<String> = emptyList()
@@ -186,7 +188,8 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         topRelayUrls: List<String> = emptyList(),
         relayHintStore: RelayHintStore? = null,
         extendedNetworkRepo: ExtendedNetworkRepository? = null,
-        paymentTargetRepo: PaymentTargetRepository? = null
+        paymentTargetRepo: PaymentTargetRepository? = null,
+        followerRepo: FollowerRepository? = null
     ) {
         targetPubkey = pubkey
         eventRepoRef = eventRepo
@@ -195,6 +198,7 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         subManagerRef = subManager
         relayHintStoreRef = relayHintStore
         relayListRepoRef = relayListRepo
+        followerRepoRef = followerRepo
         this.topRelayUrls = topRelayUrls
         oldestNoteTimestamp = Long.MAX_VALUE
         oldestReplyTimestamp = Long.MAX_VALUE
@@ -816,44 +820,78 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
 
     fun loadFollowers() {
         val pool = relayPoolRef ?: return
-        if (_followersLoading.value && _followers.value.isNotEmpty()) return
+        val pubkey = targetPubkey
+
+        // Serve the accumulated session cache instantly; a fresh-enough cache
+        // skips the refresh entirely
+        val cached = followerRepoRef?.get(pubkey).orEmpty()
+        if (cached.isNotEmpty()) {
+            _followers.value = resolveFollowerProfiles(cached)
+            _followersLoading.value = false
+            _followersError.value = false
+            if (followerRepoRef?.isFresh(pubkey) == true) return
+        } else {
+            if (_followersLoading.value) return
+            _followers.value = emptyList()
+            _followersLoading.value = true
+            _followersError.value = false
+        }
 
         profileFollowersJob?.cancel()
-        _followers.value = emptyList()
-        _followersLoading.value = true
-        _followersError.value = false
-
-        val pubkey = targetPubkey
         profileFollowersGen++
         val gen = profileFollowersGen
+        // Live row-by-row updates only while there is nothing to show yet;
+        // with a cache on screen the refresh is silent and lands as one update
+        val liveUpdate = cached.isEmpty()
 
         profileFollowersJob = viewModelScope.launch {
-            val seenPubkeys = mutableSetOf<String>()
+            val working = LinkedHashSet<String>()
             var archivesEose = false
             val archives = launch {
-                archivesEose = loadFollowersFromArchives(pool, pubkey, gen, seenPubkeys)
+                archivesEose = loadFollowersFromArchives(pool, pubkey, gen, working, liveUpdate)
             }
             val contactLists = launch {
-                loadFollowersFromContactLists(pool, pubkey, gen, seenPubkeys)
+                loadFollowersFromContactLists(pool, pubkey, gen, working)
             }
             archives.join()
             contactLists.join()
-            if (profileFollowersGen == gen) {
-                // Failure only when neither source produced anything AND the
-                // archives endpoint never finished responding; an explicit empty
-                // EOSE stays the regular empty state
+            if (profileFollowersGen != gen) return@launch
+
+            // Union this run into the cache — a run that hit slow relays must
+            // not shrink what a better run already found
+            val merged = followerRepoRef?.merge(pubkey, working) ?: working
+            fetchMissingProfiles(pool, gen, merged)
+            if (profileFollowersGen != gen) return@launch
+            if (merged.isNotEmpty()) {
+                _followers.value = resolveFollowerProfiles(merged)
+                _followersError.value = false
+            } else {
+                // Failure only when nothing was ever found AND the archives
+                // endpoint never finished responding; an explicit empty EOSE
+                // stays the regular empty state
                 _followersError.value = _followers.value.isEmpty() && !archivesEose
-                _followersLoading.value = false
             }
+            _followersLoading.value = false
         }
     }
+
+    /** Cached profile per pubkey, bare key row when none is known yet. */
+    private fun resolveFollowerProfiles(pubkeys: Collection<String>): List<ProfileData> =
+        pubkeys.map { pk ->
+            eventRepoRef?.getProfileData(pk) ?: ProfileData(
+                pubkey = pk, name = null, displayName = null, about = null,
+                picture = null, banner = null, nip05 = null, lud16 = null,
+                updatedAt = 0L
+            )
+        }
 
     /** Followers list from the archives feed endpoint. True when it EOSE'd. */
     private suspend fun loadFollowersFromArchives(
         pool: RelayPool,
         pubkey: String,
         gen: Int,
-        seenPubkeys: MutableSet<String>
+        working: MutableSet<String>,
+        liveUpdate: Boolean
     ): Boolean {
         val subId = "profile-followers-$gen"
         val filter = Filter(kinds = listOf(0), authors = listOf(pubkey), limit = 500)
@@ -867,11 +905,12 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
             pool.relayEvents.collect { (event, _, subscriptionId) ->
                 if (subscriptionId != subId) return@collect
                 if (profileFollowersGen != gen) return@collect
-                if (event.kind == 0 && seenPubkeys.add(event.pubkey)) {
+                if (event.kind == 0 && working.add(event.pubkey)) {
                     eventRepoRef?.cacheEvent(event)
-                    val profileData = ProfileData.fromEvent(event) ?: return@collect
                     got++
-                    _followers.value = _followers.value + profileData
+                    if (liveUpdate) {
+                        ProfileData.fromEvent(event)?.let { _followers.value = _followers.value + it }
+                    }
                 }
             }
         }
@@ -910,62 +949,51 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Fallback: follower pubkeys from kind 3 contact lists held by the profile's
-     * own relays (a community relay that mirrors its members' followers serves
-     * these locally), then profiles for them.
+     * Follower pubkeys from kind 3 contact lists held by the profile's own
+     * relays and the pool (a community relay that mirrors its members'
+     * followers serves these locally).
      */
     private suspend fun loadFollowersFromContactLists(
         pool: RelayPool,
         pubkey: String,
         gen: Int,
-        seenPubkeys: MutableSet<String>
+        working: MutableSet<String>
     ) {
         val relays = profileRelayCandidates(pubkey)
         val k3SubId = "profile-followers-k3-$gen"
-        val followerPubkeys = LinkedHashSet<String>()
         val k3Collect = viewModelScope.launch {
             pool.relayEvents.collect { (event, _, subscriptionId) ->
                 if (subscriptionId != k3SubId) return@collect
                 if (profileFollowersGen != gen) return@collect
-                if (event.kind == 3) followerPubkeys.add(event.pubkey)
+                if (event.kind == 3) working.add(event.pubkey)
             }
         }
         try {
             val filter = Filter(kinds = listOf(3), pTags = listOf(pubkey), limit = 500)
             val k3Msg = ClientMessage.req(k3SubId, filter)
+            // One pass over the profile's relays and the whole pool together —
+            // gating the pool on an empty first stage made results depend on
+            // which slow subset happened to answer first
             val awaiting = mutableSetOf<Pair<String, String>>()
             for (relay in relays) {
                 if (pool.sendToRelayOrEphemeral(relay, k3Msg, skipBadCheck = true)) awaiting.add(k3SubId to relay)
             }
-            Log.d("UserProfileVM", "followers: k3 fallback relays=${relays.size} sent=${awaiting.size}")
-            if (awaiting.isNotEmpty()) awaitSubDone(pool, awaiting, 10_000)
-            if (followerPubkeys.isEmpty() && profileFollowersGen == gen) {
-                // Nothing from the profile's own relays (or none known) — one
-                // pool-wide pass; the viewer's relays may hold the contact lists
-                Log.d("UserProfileVM", "followers: k3 fallback going pool-wide")
-                val awaitingAll = pool.sendToAll(k3Msg).map { k3SubId to it }.toSet()
-                awaitSubDone(pool, awaitingAll, 10_000)
-            }
+            pool.sendToAll(k3Msg).forEach { awaiting.add(k3SubId to it) }
+            Log.d("UserProfileVM", "followers: k3 queried=${awaiting.size} relays")
+            awaitSubDone(pool, awaiting, 10_000)
         } finally {
             k3Collect.cancel()
             pool.closeOnAllRelays(k3SubId)
         }
-        if (profileFollowersGen != gen) return
-        Log.d("UserProfileVM", "followers: k3 fallback found=${followerPubkeys.size}")
-        if (followerPubkeys.isEmpty()) return
+        Log.d("UserProfileVM", "followers: k3 done, total found=${working.size}")
+    }
 
-        // Show cached profiles immediately; fetch the rest
-        val uncached = mutableListOf<String>()
-        for (pk in followerPubkeys) {
-            if (!seenPubkeys.add(pk)) continue
-            val cached = eventRepoRef?.getProfileData(pk)
-            if (cached != null) _followers.value = _followers.value + cached
-            else uncached.add(pk)
-        }
-        if (uncached.isEmpty()) return
-
+    /** Fetch kind 0 profiles for any pubkeys not in the event cache yet. */
+    private suspend fun fetchMissingProfiles(pool: RelayPool, gen: Int, pubkeys: Collection<String>) {
+        val missing = pubkeys.filter { eventRepoRef?.getProfileData(it) == null }
+        if (missing.isEmpty()) return
         val k0SubId = "profile-followers-k0-$gen"
-        val wanted = uncached.toHashSet()
+        val wanted = missing.toHashSet()
         val allResolved = CompletableDeferred<Unit>()
         val k0Collect = viewModelScope.launch {
             pool.relayEvents.collect { (event, _, subscriptionId) ->
@@ -973,20 +1001,15 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                 if (profileFollowersGen != gen) return@collect
                 if (event.kind != 0 || !wanted.remove(event.pubkey)) return@collect
                 eventRepoRef?.cacheEvent(event)
-                ProfileData.fromEvent(event)?.let { _followers.value = _followers.value + it }
                 if (wanted.isEmpty()) allResolved.complete(Unit)
             }
         }
         try {
             val awaiting = mutableSetOf<Pair<String, String>>()
-            uncached.chunked(50).forEachIndexed { index, batch ->
+            missing.chunked(50).forEachIndexed { index, batch ->
                 val sub = if (index == 0) k0SubId else "$k0SubId-$index"
-                val profileFilter = Filter(kinds = listOf(0), authors = batch, limit = batch.size)
-                val msg = ClientMessage.req(sub, profileFilter)
+                val msg = ClientMessage.req(sub, Filter(kinds = listOf(0), authors = batch, limit = batch.size))
                 pool.sendToAll(msg).forEach { awaiting.add(sub to it) }
-                for (relay in relays) {
-                    if (pool.sendToRelayOrEphemeral(relay, msg, skipBadCheck = true)) awaiting.add(sub to relay)
-                }
                 for (url in RelayConfig.DEFAULT_INDEXER_RELAYS) {
                     if (pool.sendToRelayOrEphemeral(url, msg)) awaiting.add(sub to url)
                 }
@@ -994,24 +1017,12 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
             // Done when every profile resolved or every queried relay EOSE'd —
             // the timeout only backstops relays that never answer
             awaitSubDone(pool, awaiting, 12_000, allResolved)
-            Log.d("UserProfileVM", "followers: k0 fetch unresolved=${wanted.size} of ${uncached.size}")
+            Log.d("UserProfileVM", "followers: k0 fetch unresolved=${wanted.size} of ${missing.size}")
         } finally {
             k0Collect.cancel()
             pool.closeOnAllRelays(k0SubId)
-            val chunks = (uncached.size + 49) / 50
+            val chunks = (missing.size + 49) / 50
             for (i in 1 until chunks) pool.closeOnAllRelays("$k0SubId-$i")
-        }
-
-        // Followers whose profile never resolved still count — show a bare key
-        // row instead of silently dropping them
-        if (profileFollowersGen == gen && wanted.isNotEmpty()) {
-            _followers.value = _followers.value + wanted.map { pk ->
-                ProfileData(
-                    pubkey = pk, name = null, displayName = null, about = null,
-                    picture = null, banner = null, nip05 = null, lud16 = null,
-                    updatedAt = 0L
-                )
-            }
         }
     }
 

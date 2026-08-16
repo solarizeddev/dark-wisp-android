@@ -54,6 +54,7 @@ import com.darkwisp.app.repo.ZapPreferences
 import com.darkwisp.app.repo.RelayHintStore
 import com.darkwisp.app.repo.RelayInfoRepository
 import com.darkwisp.app.repo.TranslationRepository
+import com.darkwisp.app.repo.FollowerRepository
 import com.darkwisp.app.repo.PaymentTargetRepository
 import com.darkwisp.app.repo.RelayListRepository
 import com.darkwisp.app.repo.RelaySetRepository
@@ -237,6 +238,7 @@ class FeedViewModel(app: Application) : AndroidViewModel(app) {
     val notifRepo = NotificationRepository(app, pubkeyHex, muteRepo, eventRepo)
     val relayListRepo = RelayListRepository(app)
     val paymentTargetRepo = PaymentTargetRepository(app)
+    val followerRepo = FollowerRepository()
     val bookmarkRepo = BookmarkRepository(app, pubkeyHex)
     val bookmarkSetRepo = BookmarkSetRepository(app, pubkeyHex)
     val relaySetRepo = RelaySetRepository(app, pubkeyHex)
