@@ -662,12 +662,10 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
                 val providerFilter = Filter(kinds = listOf(Nip85.KIND_PROVIDER_LIST), authors = listOf(pubkey), limit = 1)
-                val router = outboxRouterRef
-                if (router != null) {
-                    router.subscribeToUserWriteRelays(providerSubId, pubkey, providerFilter)
-                } else {
-                    pool.sendToAll(ClientMessage.req(providerSubId, providerFilter))
-                }
+                outboxRouterRef?.subscribeToUserWriteRelays(providerSubId, pubkey, providerFilter)
+                // Tiny replaceable-event REQ — also ask the whole pool and the
+                // indexers so the list is found wherever it was published
+                pool.sendToAll(ClientMessage.req(providerSubId, providerFilter))
                 for (url in RelayConfig.DEFAULT_INDEXER_RELAYS) {
                     pool.sendToRelayOrEphemeral(url, ClientMessage.req(providerSubId, providerFilter))
                 }
@@ -682,14 +680,17 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
 
                 var found = false
                 if (provider != null) {
-                    val relays = provider.relayHint?.let { listOf(it) } ?: awaitWriteRelays(pubkey)
+                    val relays = provider.relayHint?.let { listOf(it) } ?: profileRelayCandidates(pubkey)
                     found = fetchFollowerAssertion(pool, "nip85-followers-$gen-p", relays, provider.pubkey, pubkey, gen)
                 }
                 if (!found && followerCountGen == gen) {
                     // No provider list (or it yielded nothing): ask the profile's own
-                    // relays for a card — a relay running a NIP-85 provider serves its
-                    // members' assertions locally
-                    fetchFollowerAssertion(pool, "nip85-followers-$gen-w", awaitWriteRelays(pubkey), null, pubkey, gen)
+                    // relays and the whole pool — a relay running a NIP-85 provider
+                    // serves its members' assertions locally
+                    fetchFollowerAssertion(
+                        pool, "nip85-followers-$gen-w", profileRelayCandidates(pubkey),
+                        null, pubkey, gen, includeAllRelays = true
+                    )
                 }
             } finally {
                 pool.closeOnAllRelays(providerSubId)
@@ -710,6 +711,18 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Relays likely to hold the profile's data: NIP-65 write relays plus relays
+     * their events have actually been seen on. All runtime-derived — no
+     * hardcoded relay list.
+     */
+    private suspend fun profileRelayCandidates(pubkey: String): List<String> {
+        val relays = LinkedHashSet<String>()
+        relays.addAll(awaitWriteRelays(pubkey))
+        relayHintStoreRef?.getHints(pubkey)?.let { relays.addAll(it) }
+        return relays.take(8)
+    }
+
+    /**
      * Query relays for a kind 30382 follower assertion about [pubkey]. The newest
      * card wins; [authorPubkey] pins the accepted author when the profile named a
      * provider. True when a count was found.
@@ -720,9 +733,10 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         relays: List<String>,
         authorPubkey: String?,
         pubkey: String,
-        gen: Int
+        gen: Int,
+        includeAllRelays: Boolean = false
     ): Boolean {
-        if (relays.isEmpty()) return false
+        if (relays.isEmpty() && !includeAllRelays) return false
         var latest = 0L
         val collectJob = viewModelScope.launch {
             pool.relayEvents.collect { (event, relayUrl, subscriptionId) ->
@@ -745,16 +759,16 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                 limit = 1
             )
             var sentCount = 0
-            for (relay in relays.take(8)) {
+            for (relay in relays) {
                 if (pool.sendToRelayOrEphemeral(relay, ClientMessage.req(subId, filter), skipBadCheck = true)) sentCount++
             }
-            Log.d("UserProfileVM", "nip85: query ${relays.take(8)} author=${authorPubkey?.take(8) ?: "any"} sent=$sentCount")
-            if (sentCount > 0) {
-                val sm = subManagerRef
-                if (sm != null) sm.awaitEoseCount(subId, sentCount, 8_000)
-                else withTimeoutOrNull(8_000) { pool.eoseSignals.first { it == subId } }
-                // The matching EVENT can still be in flight when EOSE lands
-                delay(250)
+            if (includeAllRelays) pool.sendToAll(ClientMessage.req(subId, filter))
+            Log.d("UserProfileVM", "nip85: query relays=$relays all=$includeAllRelays author=${authorPubkey?.take(8) ?: "any"} sent=$sentCount")
+            if (sentCount > 0 || includeAllRelays) {
+                withTimeoutOrNull(8_000) { pool.eoseSignals.first { it == subId } }
+                // The first EOSE is often a fast relay without the card — grace
+                // for the one that has it
+                delay(1_000)
             }
         } finally {
             collectJob.cancel()
@@ -863,11 +877,7 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         gen: Int,
         seenPubkeys: MutableSet<String>
     ) {
-        val relays = awaitWriteRelays(pubkey).take(8)
-        if (relays.isEmpty()) {
-            Log.d("UserProfileVM", "followers: no relay list for k3 fallback")
-            return
-        }
+        val relays = profileRelayCandidates(pubkey)
         val k3SubId = "profile-followers-k3-$gen"
         val followerPubkeys = LinkedHashSet<String>()
         val k3Collect = viewModelScope.launch {
@@ -889,6 +899,14 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                 if (sm != null) sm.awaitEoseCount(k3SubId, sentCount, 10_000)
                 else withTimeoutOrNull(10_000) { pool.eoseSignals.first { it == k3SubId } }
                 delay(500)
+            }
+            if (followerPubkeys.isEmpty() && profileFollowersGen == gen) {
+                // Nothing from the profile's own relays (or none known) — one
+                // pool-wide pass; the viewer's relays may hold the contact lists
+                Log.d("UserProfileVM", "followers: k3 fallback going pool-wide")
+                pool.sendToAll(ClientMessage.req(k3SubId, filter))
+                withTimeoutOrNull(10_000) { pool.eoseSignals.first { it == k3SubId } }
+                delay(1_000)
             }
         } finally {
             k3Collect.cancel()
