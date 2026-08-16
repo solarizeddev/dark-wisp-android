@@ -17,19 +17,6 @@ object Nip85 {
 
     data class Provider(val pubkey: String, val relayHint: String?)
 
-    /** A relay to query for assertions; a non-null pubkey pins the accepted author. */
-    data class ProviderRelay(val pubkey: String?, val relay: String)
-
-    /** Tried in order when the profile's kind 10040 is absent or yields nothing. */
-    val DEFAULT_PROVIDERS = listOf(
-        // stack.solar community provider — relay-cards bot, cards live only on this relay
-        ProviderRelay(
-            "927f57b04121d7988e4febebad5226a016c44ddb946f90729f7be5d15b800f28",
-            "wss://relay.stack.solar"
-        ),
-        ProviderRelay(null, "wss://nip85.nostr.band")
-    )
-
     /** Provider the user trusts for [assertion] (e.g. "followers") per their kind 10040. */
     fun parseProvider(event: NostrEvent, assertion: String): Provider? {
         if (event.kind != KIND_PROVIDER_LIST) return null

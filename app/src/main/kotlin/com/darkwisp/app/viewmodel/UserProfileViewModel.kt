@@ -144,6 +144,7 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
     private var outboxRouterRef: OutboxRouter? = null
     private var subManagerRef: SubscriptionManager? = null
     private var relayHintStoreRef: RelayHintStore? = null
+    private var relayListRepoRef: RelayListRepository? = null
     private var paymentTargetRepoRef: PaymentTargetRepository? = null
     private val activeEngagementSubIds = mutableListOf<String>()
     private val activeFollowProfileSubIds = mutableListOf<String>()
@@ -192,6 +193,7 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         outboxRouterRef = outboxRouter
         subManagerRef = subManager
         relayHintStoreRef = relayHintStore
+        relayListRepoRef = relayListRepo
         this.topRelayUrls = topRelayUrls
         oldestNoteTimestamp = Long.MAX_VALUE
         oldestReplyTimestamp = Long.MAX_VALUE
@@ -678,22 +680,16 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                 val provider = providerList?.let { Nip85.parseProvider(it, Nip85.ASSERTION_FOLLOWERS) }
                 Log.d("UserProfileVM", "nip85: 10040=${providerList != null} provider=${provider?.pubkey?.take(8)} hint=${provider?.relayHint}")
 
-                // The profile's chosen provider first, then the defaults
-                val candidates = buildList {
-                    if (provider != null) {
-                        if (provider.relayHint != null) {
-                            add(Nip85.ProviderRelay(provider.pubkey, provider.relayHint))
-                        } else {
-                            for (dp in Nip85.DEFAULT_PROVIDERS) add(Nip85.ProviderRelay(provider.pubkey, dp.relay))
-                        }
-                    }
-                    for (dp in Nip85.DEFAULT_PROVIDERS) {
-                        if (none { it.pubkey == dp.pubkey && it.relay == dp.relay }) add(dp)
-                    }
+                var found = false
+                if (provider != null) {
+                    val relays = provider.relayHint?.let { listOf(it) } ?: awaitWriteRelays(pubkey)
+                    found = fetchFollowerAssertion(pool, "nip85-followers-$gen-p", relays, provider.pubkey, pubkey, gen)
                 }
-                for ((index, candidate) in candidates.withIndex()) {
-                    if (followerCountGen != gen) return@launch
-                    if (fetchFollowerAssertion(pool, "nip85-followers-$gen-$index", candidate, pubkey, gen)) break
+                if (!found && followerCountGen == gen) {
+                    // No provider list (or it yielded nothing): ask the profile's own
+                    // relays for a card — a relay running a NIP-85 provider serves its
+                    // members' assertions locally
+                    fetchFollowerAssertion(pool, "nip85-followers-$gen-w", awaitWriteRelays(pubkey), null, pubkey, gen)
                 }
             } finally {
                 pool.closeOnAllRelays(providerSubId)
@@ -701,37 +697,62 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Query one relay for a kind 30382 follower assertion. True when a count was found. */
+    /** The profile's NIP-65 write relays, waiting briefly for a list still in flight. */
+    private suspend fun awaitWriteRelays(pubkey: String, timeoutMs: Long = 6_000): List<String> {
+        val repo = relayListRepoRef ?: return emptyList()
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (true) {
+            val relays = repo.getWriteRelays(pubkey)
+            if (!relays.isNullOrEmpty()) return relays
+            if (System.currentTimeMillis() >= deadline) return emptyList()
+            delay(500)
+        }
+    }
+
+    /**
+     * Query relays for a kind 30382 follower assertion about [pubkey]. The newest
+     * card wins; [authorPubkey] pins the accepted author when the profile named a
+     * provider. True when a count was found.
+     */
     private suspend fun fetchFollowerAssertion(
         pool: RelayPool,
         subId: String,
-        candidate: Nip85.ProviderRelay,
+        relays: List<String>,
+        authorPubkey: String?,
         pubkey: String,
         gen: Int
     ): Boolean {
-        var found = false
+        if (relays.isEmpty()) return false
+        var latest = 0L
         val collectJob = viewModelScope.launch {
-            pool.relayEvents.collect { (event, _, subscriptionId) ->
+            pool.relayEvents.collect { (event, relayUrl, subscriptionId) ->
                 if (subscriptionId != subId) return@collect
                 if (followerCountGen != gen) return@collect
-                if (candidate.pubkey != null && event.pubkey != candidate.pubkey) return@collect
+                if (authorPubkey != null && event.pubkey != authorPubkey) return@collect
                 val count = Nip85.parseFollowerCount(event, pubkey) ?: return@collect
-                found = true
-                _followerCount.value = count
-                _followerCountSource.value = candidate.relay.removePrefix("wss://").removePrefix("ws://").trimEnd('/')
+                if (event.created_at > latest) {
+                    latest = event.created_at
+                    _followerCount.value = count
+                    _followerCountSource.value = relayUrl.removePrefix("wss://").removePrefix("ws://").trimEnd('/')
+                }
             }
         }
         try {
             val filter = Filter(
                 kinds = listOf(Nip85.KIND_ASSERTION),
-                authors = candidate.pubkey?.let { listOf(it) },
+                authors = authorPubkey?.let { listOf(it) },
                 dTags = listOf(pubkey),
                 limit = 1
             )
-            val sent = pool.sendToRelayOrEphemeral(candidate.relay, ClientMessage.req(subId, filter), skipBadCheck = true)
-            Log.d("UserProfileVM", "nip85: query ${candidate.relay} author=${candidate.pubkey?.take(8) ?: "any"} sent=$sent")
-            if (sent) {
-                withTimeoutOrNull(8_000) { pool.eoseSignals.first { it == subId } }
+            var sentCount = 0
+            for (relay in relays.take(8)) {
+                if (pool.sendToRelayOrEphemeral(relay, ClientMessage.req(subId, filter), skipBadCheck = true)) sentCount++
+            }
+            Log.d("UserProfileVM", "nip85: query ${relays.take(8)} author=${authorPubkey?.take(8) ?: "any"} sent=$sentCount")
+            if (sentCount > 0) {
+                val sm = subManagerRef
+                if (sm != null) sm.awaitEoseCount(subId, sentCount, 8_000)
+                else withTimeoutOrNull(8_000) { pool.eoseSignals.first { it == subId } }
                 // The matching EVENT can still be in flight when EOSE lands
                 delay(250)
             }
@@ -739,8 +760,8 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
             collectJob.cancel()
             pool.closeOnAllRelays(subId)
         }
-        Log.d("UserProfileVM", "nip85: ${candidate.relay} -> found=$found")
-        return found
+        Log.d("UserProfileVM", "nip85: $subId -> found=${latest > 0L}")
+        return latest > 0L
     }
 
     fun loadFollowers() {
@@ -755,59 +776,166 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         val pubkey = targetPubkey
         profileFollowersGen++
         val gen = profileFollowersGen
-        val subId = "profile-followers-$gen"
 
         profileFollowersJob = viewModelScope.launch {
-            val filter = Filter(kinds = listOf(0), authors = listOf(pubkey), limit = 500)
-            var connected = false
-            val url = "wss://feeds.nostrarchives.com/profiles/followers"
-            for (attempt in 0..2) {
-                if (profileFollowersGen != gen) { _followersLoading.value = false; return@launch }
-                if (attempt > 0) { pool.disconnectRelay(url); delay(1500L) }
-                pool.sendToRelayOrEphemeral(url, ClientMessage.req(subId, filter), skipBadCheck = true)
-                val deadline = System.currentTimeMillis() + 5_000
-                while (System.currentTimeMillis() < deadline) {
-                    if (profileFollowersGen != gen) { _followersLoading.value = false; return@launch }
-                    if (pool.isRelayConnected(url)) { connected = true; break }
-                    delay(200)
-                }
-                if (connected) break
-            }
-            if (!connected) {
-                // Endpoint down, blocked, or in cooldown — distinct from a profile
-                // that genuinely has no followers
-                _followersError.value = true
-                _followersLoading.value = false
-                return@launch
-            }
-
             val seenPubkeys = mutableSetOf<String>()
-            val collectJob = launch {
-                pool.relayEvents.collect { (event, _, subscriptionId) ->
-                    if (subscriptionId != subId) return@collect
-                    if (profileFollowersGen != gen) return@collect
-                    if (event.kind == 0 && seenPubkeys.add(event.pubkey)) {
-                        eventRepoRef?.cacheEvent(event)
-                        val profileData = ProfileData.fromEvent(event) ?: return@collect
-                        val current = _followers.value.toMutableList()
-                        current.add(profileData)
-                        _followers.value = current
-                    }
+            var archivesEose = false
+            val archives = launch {
+                archivesEose = loadFollowersFromArchives(pool, pubkey, gen, seenPubkeys)
+            }
+            val contactLists = launch {
+                loadFollowersFromContactLists(pool, pubkey, gen, seenPubkeys)
+            }
+            archives.join()
+            contactLists.join()
+            if (profileFollowersGen == gen) {
+                // Failure only when neither source produced anything AND the
+                // archives endpoint never finished responding; an explicit empty
+                // EOSE stays the regular empty state
+                _followersError.value = _followers.value.isEmpty() && !archivesEose
+                _followersLoading.value = false
+            }
+        }
+    }
+
+    /** Followers list from the archives feed endpoint. True when it EOSE'd. */
+    private suspend fun loadFollowersFromArchives(
+        pool: RelayPool,
+        pubkey: String,
+        gen: Int,
+        seenPubkeys: MutableSet<String>
+    ): Boolean {
+        val subId = "profile-followers-$gen"
+        val filter = Filter(kinds = listOf(0), authors = listOf(pubkey), limit = 500)
+        var connected = false
+        val url = "wss://feeds.nostrarchives.com/profiles/followers"
+        for (attempt in 0..2) {
+            if (profileFollowersGen != gen) return false
+            if (attempt > 0) { pool.disconnectRelay(url); delay(1500L) }
+            pool.sendToRelayOrEphemeral(url, ClientMessage.req(subId, filter), skipBadCheck = true)
+            val deadline = System.currentTimeMillis() + 5_000
+            while (System.currentTimeMillis() < deadline) {
+                if (profileFollowersGen != gen) return false
+                if (pool.isRelayConnected(url)) { connected = true; break }
+                delay(200)
+            }
+            if (connected) break
+        }
+        if (!connected) {
+            Log.d("UserProfileVM", "followers: archives endpoint never connected")
+            return false
+        }
+
+        var got = 0
+        val collectJob = viewModelScope.launch {
+            pool.relayEvents.collect { (event, _, subscriptionId) ->
+                if (subscriptionId != subId) return@collect
+                if (profileFollowersGen != gen) return@collect
+                if (event.kind == 0 && seenPubkeys.add(event.pubkey)) {
+                    eventRepoRef?.cacheEvent(event)
+                    val profileData = ProfileData.fromEvent(event) ?: return@collect
+                    got++
+                    _followers.value = _followers.value + profileData
                 }
             }
-
+        }
+        var gotEose = false
+        try {
             val sm = subManagerRef
-            val gotEose = if (sm != null) sm.awaitEoseCount(subId, 1) > 0
+            gotEose = if (sm != null) sm.awaitEoseCount(subId, 1) > 0
             else withTimeoutOrNull(15_000) { pool.eoseSignals.first { it == subId } } != null
+        } finally {
             collectJob.cancel()
             pool.closeOnAllRelays(subId)
-            // Connected but the endpoint never finished responding — that's a
-            // failure, not a profile with no followers. An explicit empty EOSE
-            // still shows the regular empty state.
-            if (!gotEose && _followers.value.isEmpty() && profileFollowersGen == gen) {
-                _followersError.value = true
+        }
+        Log.d("UserProfileVM", "followers: archives eose=$gotEose got=$got")
+        return gotEose
+    }
+
+    /**
+     * Fallback: follower pubkeys from kind 3 contact lists held by the profile's
+     * own relays (a community relay that mirrors its members' followers serves
+     * these locally), then profiles for them.
+     */
+    private suspend fun loadFollowersFromContactLists(
+        pool: RelayPool,
+        pubkey: String,
+        gen: Int,
+        seenPubkeys: MutableSet<String>
+    ) {
+        val relays = awaitWriteRelays(pubkey).take(8)
+        if (relays.isEmpty()) {
+            Log.d("UserProfileVM", "followers: no relay list for k3 fallback")
+            return
+        }
+        val k3SubId = "profile-followers-k3-$gen"
+        val followerPubkeys = LinkedHashSet<String>()
+        val k3Collect = viewModelScope.launch {
+            pool.relayEvents.collect { (event, _, subscriptionId) ->
+                if (subscriptionId != k3SubId) return@collect
+                if (profileFollowersGen != gen) return@collect
+                if (event.kind == 3) followerPubkeys.add(event.pubkey)
             }
-            _followersLoading.value = false
+        }
+        try {
+            val filter = Filter(kinds = listOf(3), pTags = listOf(pubkey), limit = 500)
+            var sentCount = 0
+            for (relay in relays) {
+                if (pool.sendToRelayOrEphemeral(relay, ClientMessage.req(k3SubId, filter), skipBadCheck = true)) sentCount++
+            }
+            Log.d("UserProfileVM", "followers: k3 fallback relays=${relays.size} sent=$sentCount")
+            if (sentCount > 0) {
+                val sm = subManagerRef
+                if (sm != null) sm.awaitEoseCount(k3SubId, sentCount, 10_000)
+                else withTimeoutOrNull(10_000) { pool.eoseSignals.first { it == k3SubId } }
+                delay(500)
+            }
+        } finally {
+            k3Collect.cancel()
+            pool.closeOnAllRelays(k3SubId)
+        }
+        if (profileFollowersGen != gen) return
+        Log.d("UserProfileVM", "followers: k3 fallback found=${followerPubkeys.size}")
+        if (followerPubkeys.isEmpty()) return
+
+        // Show cached profiles immediately; fetch the rest
+        val uncached = mutableListOf<String>()
+        for (pk in followerPubkeys) {
+            if (!seenPubkeys.add(pk)) continue
+            val cached = eventRepoRef?.getProfileData(pk)
+            if (cached != null) _followers.value = _followers.value + cached
+            else uncached.add(pk)
+        }
+        if (uncached.isEmpty()) return
+
+        val k0SubId = "profile-followers-k0-$gen"
+        val wanted = uncached.toHashSet()
+        val k0Collect = viewModelScope.launch {
+            pool.relayEvents.collect { (event, _, subscriptionId) ->
+                if (!subscriptionId.startsWith(k0SubId)) return@collect
+                if (profileFollowersGen != gen) return@collect
+                if (event.kind != 0 || !wanted.remove(event.pubkey)) return@collect
+                eventRepoRef?.cacheEvent(event)
+                val profileData = ProfileData.fromEvent(event) ?: return@collect
+                _followers.value = _followers.value + profileData
+            }
+        }
+        try {
+            uncached.chunked(50).forEachIndexed { index, batch ->
+                val sub = if (index == 0) k0SubId else "$k0SubId-$index"
+                val profileFilter = Filter(kinds = listOf(0), authors = batch, limit = batch.size)
+                pool.sendToAll(ClientMessage.req(sub, profileFilter))
+                for (relay in relays) {
+                    pool.sendToRelayOrEphemeral(relay, ClientMessage.req(sub, profileFilter), skipBadCheck = true)
+                }
+            }
+            withTimeoutOrNull(10_000) { pool.eoseSignals.first { it == k0SubId } }
+            delay(1_000)
+        } finally {
+            k0Collect.cancel()
+            pool.closeOnAllRelays(k0SubId)
+            val chunks = (uncached.size + 49) / 50
+            for (i in 1 until chunks) pool.closeOnAllRelays("$k0SubId-$i")
         }
     }
 
