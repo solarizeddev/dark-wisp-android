@@ -946,6 +946,9 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                 for (relay in relays) {
                     pool.sendToRelayOrEphemeral(relay, ClientMessage.req(sub, profileFilter), skipBadCheck = true)
                 }
+                for (url in RelayConfig.DEFAULT_INDEXER_RELAYS) {
+                    pool.sendToRelayOrEphemeral(url, ClientMessage.req(sub, profileFilter))
+                }
             }
             // Wait until every pending profile resolves or the window closes —
             // the first EOSE lands long before slower relays deliver their
@@ -959,6 +962,18 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
             pool.closeOnAllRelays(k0SubId)
             val chunks = (uncached.size + 49) / 50
             for (i in 1 until chunks) pool.closeOnAllRelays("$k0SubId-$i")
+        }
+
+        // Followers whose profile never resolved still count — show a bare key
+        // row instead of silently dropping them
+        if (profileFollowersGen == gen && wanted.isNotEmpty()) {
+            _followers.value = _followers.value + wanted.map { pk ->
+                ProfileData(
+                    pubkey = pk, name = null, displayName = null, about = null,
+                    picture = null, banner = null, nip05 = null, lud16 = null,
+                    updatedAt = 0L
+                )
+            }
         }
     }
 
