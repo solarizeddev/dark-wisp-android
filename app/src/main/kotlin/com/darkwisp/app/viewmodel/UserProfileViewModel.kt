@@ -29,6 +29,7 @@ import com.darkwisp.app.repo.PaymentTargetRepository
 import com.darkwisp.app.repo.RelayHintStore
 import com.darkwisp.app.repo.RelayListRepository
 import com.darkwisp.app.relay.SubscriptionManager
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -662,16 +663,17 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
                 val providerFilter = Filter(kinds = listOf(Nip85.KIND_PROVIDER_LIST), authors = listOf(pubkey), limit = 1)
+                val providerMsg = ClientMessage.req(providerSubId, providerFilter)
+                val awaiting = mutableSetOf<Pair<String, String>>()
                 outboxRouterRef?.subscribeToUserWriteRelays(providerSubId, pubkey, providerFilter)
+                    ?.forEach { awaiting.add(providerSubId to it) }
                 // Tiny replaceable-event REQ — also ask the whole pool and the
                 // indexers so the list is found wherever it was published
-                pool.sendToAll(ClientMessage.req(providerSubId, providerFilter))
+                pool.sendToAll(providerMsg).forEach { awaiting.add(providerSubId to it) }
                 for (url in RelayConfig.DEFAULT_INDEXER_RELAYS) {
-                    pool.sendToRelayOrEphemeral(url, ClientMessage.req(providerSubId, providerFilter))
+                    if (pool.sendToRelayOrEphemeral(url, providerMsg)) awaiting.add(providerSubId to url)
                 }
-                withTimeoutOrNull(6_000) { pool.eoseSignals.first { it == providerSubId } }
-                // First EOSE may come from a relay without the event — grace for stragglers
-                delay(1_000)
+                awaitSubDone(pool, awaiting, 6_000)
                 providerCollect.cancel()
                 pool.closeOnAllRelays(providerSubId)
 
@@ -707,6 +709,44 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
             if (!relays.isNullOrEmpty()) return relays
             if (System.currentTimeMillis() >= deadline) return emptyList()
             delay(500)
+        }
+    }
+
+    /**
+     * Wait until every (subscriptionId, relayUrl) pair in [awaiting] has sent
+     * EOSE, [dataDone] completes, or [timeoutMs] passes. The timeout is only a
+     * backstop for relays that die mid-subscription — completion normally comes
+     * from the relays themselves. Returns false when the backstop fired.
+     */
+    private suspend fun awaitSubDone(
+        pool: RelayPool,
+        awaiting: Set<Pair<String, String>>,
+        timeoutMs: Long,
+        dataDone: CompletableDeferred<Unit>? = null
+    ): Boolean {
+        val outstanding = awaiting.toMutableSet()
+        val finished = CompletableDeferred<Unit>()
+        val watchers = mutableListOf<Job>()
+        if (outstanding.isNotEmpty()) {
+            watchers += viewModelScope.launch {
+                pool.eoseDetails.first { pair ->
+                    outstanding.remove(pair)
+                    outstanding.isEmpty()
+                }
+                finished.complete(Unit)
+            }
+        }
+        if (dataDone != null) {
+            watchers += viewModelScope.launch {
+                dataDone.await()
+                finished.complete(Unit)
+            }
+        }
+        if (watchers.isEmpty()) return false
+        return try {
+            withTimeoutOrNull(timeoutMs) { finished.await() } != null
+        } finally {
+            for (w in watchers) w.cancel()
         }
     }
 
@@ -758,18 +798,14 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                 dTags = listOf(pubkey),
                 limit = 1
             )
-            var sentCount = 0
+            val msg = ClientMessage.req(subId, filter)
+            val awaiting = mutableSetOf<Pair<String, String>>()
             for (relay in relays) {
-                if (pool.sendToRelayOrEphemeral(relay, ClientMessage.req(subId, filter), skipBadCheck = true)) sentCount++
+                if (pool.sendToRelayOrEphemeral(relay, msg, skipBadCheck = true)) awaiting.add(subId to relay)
             }
-            if (includeAllRelays) pool.sendToAll(ClientMessage.req(subId, filter))
-            Log.d("UserProfileVM", "nip85: query relays=$relays all=$includeAllRelays author=${authorPubkey?.take(8) ?: "any"} sent=$sentCount")
-            if (sentCount > 0 || includeAllRelays) {
-                withTimeoutOrNull(8_000) { pool.eoseSignals.first { it == subId } }
-                // The first EOSE is often a fast relay without the card — grace
-                // for the one that has it
-                delay(1_000)
-            }
+            if (includeAllRelays) pool.sendToAll(msg).forEach { awaiting.add(subId to it) }
+            Log.d("UserProfileVM", "nip85: query relays=$relays all=$includeAllRelays author=${authorPubkey?.take(8) ?: "any"} sent=${awaiting.size}")
+            awaitSubDone(pool, awaiting, 8_000)
         } finally {
             collectJob.cancel()
             pool.closeOnAllRelays(subId)
@@ -821,25 +857,11 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
     ): Boolean {
         val subId = "profile-followers-$gen"
         val filter = Filter(kinds = listOf(0), authors = listOf(pubkey), limit = 500)
-        var connected = false
         val url = "wss://feeds.nostrarchives.com/profiles/followers"
-        for (attempt in 0..2) {
-            if (profileFollowersGen != gen) return false
-            if (attempt > 0) { pool.disconnectRelay(url); delay(1500L) }
-            pool.sendToRelayOrEphemeral(url, ClientMessage.req(subId, filter), skipBadCheck = true)
-            val deadline = System.currentTimeMillis() + 5_000
-            while (System.currentTimeMillis() < deadline) {
-                if (profileFollowersGen != gen) return false
-                if (pool.isRelayConnected(url)) { connected = true; break }
-                delay(200)
-            }
-            if (connected) break
-        }
-        if (!connected) {
-            Log.d("UserProfileVM", "followers: archives endpoint never connected")
-            return false
-        }
 
+        // Collector and EOSE watch start before the first send — the endpoint
+        // can answer while the connect loop is still polling, and anything
+        // emitted before subscribing would be lost
         var got = 0
         val collectJob = viewModelScope.launch {
             pool.relayEvents.collect { (event, _, subscriptionId) ->
@@ -853,13 +875,34 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+        val eoseSeen = CompletableDeferred<Unit>()
+        val eoseWatch = viewModelScope.launch {
+            pool.eoseDetails.first { it.first == subId && it.second == url }
+            eoseSeen.complete(Unit)
+        }
         var gotEose = false
         try {
-            val sm = subManagerRef
-            gotEose = if (sm != null) sm.awaitEoseCount(subId, 1) > 0
-            else withTimeoutOrNull(15_000) { pool.eoseSignals.first { it == subId } } != null
+            var connected = false
+            for (attempt in 0..2) {
+                if (profileFollowersGen != gen) return false
+                if (attempt > 0) { pool.disconnectRelay(url); delay(1500L) }
+                pool.sendToRelayOrEphemeral(url, ClientMessage.req(subId, filter), skipBadCheck = true)
+                val deadline = System.currentTimeMillis() + 5_000
+                while (System.currentTimeMillis() < deadline) {
+                    if (profileFollowersGen != gen) return false
+                    if (pool.isRelayConnected(url)) { connected = true; break }
+                    delay(200)
+                }
+                if (connected) break
+            }
+            if (!connected) {
+                Log.d("UserProfileVM", "followers: archives endpoint never connected")
+                return false
+            }
+            gotEose = withTimeoutOrNull(15_000) { eoseSeen.await() } != null
         } finally {
             collectJob.cancel()
+            eoseWatch.cancel()
             pool.closeOnAllRelays(subId)
         }
         Log.d("UserProfileVM", "followers: archives eose=$gotEose got=$got")
@@ -889,24 +932,19 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
         }
         try {
             val filter = Filter(kinds = listOf(3), pTags = listOf(pubkey), limit = 500)
-            var sentCount = 0
+            val k3Msg = ClientMessage.req(k3SubId, filter)
+            val awaiting = mutableSetOf<Pair<String, String>>()
             for (relay in relays) {
-                if (pool.sendToRelayOrEphemeral(relay, ClientMessage.req(k3SubId, filter), skipBadCheck = true)) sentCount++
+                if (pool.sendToRelayOrEphemeral(relay, k3Msg, skipBadCheck = true)) awaiting.add(k3SubId to relay)
             }
-            Log.d("UserProfileVM", "followers: k3 fallback relays=${relays.size} sent=$sentCount")
-            if (sentCount > 0) {
-                val sm = subManagerRef
-                if (sm != null) sm.awaitEoseCount(k3SubId, sentCount, 10_000)
-                else withTimeoutOrNull(10_000) { pool.eoseSignals.first { it == k3SubId } }
-                delay(500)
-            }
+            Log.d("UserProfileVM", "followers: k3 fallback relays=${relays.size} sent=${awaiting.size}")
+            if (awaiting.isNotEmpty()) awaitSubDone(pool, awaiting, 10_000)
             if (followerPubkeys.isEmpty() && profileFollowersGen == gen) {
                 // Nothing from the profile's own relays (or none known) — one
                 // pool-wide pass; the viewer's relays may hold the contact lists
                 Log.d("UserProfileVM", "followers: k3 fallback going pool-wide")
-                pool.sendToAll(ClientMessage.req(k3SubId, filter))
-                withTimeoutOrNull(10_000) { pool.eoseSignals.first { it == k3SubId } }
-                delay(1_000)
+                val awaitingAll = pool.sendToAll(k3Msg).map { k3SubId to it }.toSet()
+                awaitSubDone(pool, awaitingAll, 10_000)
             }
         } finally {
             k3Collect.cancel()
@@ -928,34 +966,34 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
 
         val k0SubId = "profile-followers-k0-$gen"
         val wanted = uncached.toHashSet()
+        val allResolved = CompletableDeferred<Unit>()
         val k0Collect = viewModelScope.launch {
             pool.relayEvents.collect { (event, _, subscriptionId) ->
                 if (!subscriptionId.startsWith(k0SubId)) return@collect
                 if (profileFollowersGen != gen) return@collect
                 if (event.kind != 0 || !wanted.remove(event.pubkey)) return@collect
                 eventRepoRef?.cacheEvent(event)
-                val profileData = ProfileData.fromEvent(event) ?: return@collect
-                _followers.value = _followers.value + profileData
+                ProfileData.fromEvent(event)?.let { _followers.value = _followers.value + it }
+                if (wanted.isEmpty()) allResolved.complete(Unit)
             }
         }
         try {
+            val awaiting = mutableSetOf<Pair<String, String>>()
             uncached.chunked(50).forEachIndexed { index, batch ->
                 val sub = if (index == 0) k0SubId else "$k0SubId-$index"
                 val profileFilter = Filter(kinds = listOf(0), authors = batch, limit = batch.size)
-                pool.sendToAll(ClientMessage.req(sub, profileFilter))
+                val msg = ClientMessage.req(sub, profileFilter)
+                pool.sendToAll(msg).forEach { awaiting.add(sub to it) }
                 for (relay in relays) {
-                    pool.sendToRelayOrEphemeral(relay, ClientMessage.req(sub, profileFilter), skipBadCheck = true)
+                    if (pool.sendToRelayOrEphemeral(relay, msg, skipBadCheck = true)) awaiting.add(sub to relay)
                 }
                 for (url in RelayConfig.DEFAULT_INDEXER_RELAYS) {
-                    pool.sendToRelayOrEphemeral(url, ClientMessage.req(sub, profileFilter))
+                    if (pool.sendToRelayOrEphemeral(url, msg)) awaiting.add(sub to url)
                 }
             }
-            // Wait until every pending profile resolves or the window closes —
-            // the first EOSE lands long before slower relays deliver their
-            // kind 0s, so it is useless as a stop signal here
-            withTimeoutOrNull(12_000) {
-                while (wanted.isNotEmpty()) delay(250)
-            }
+            // Done when every profile resolved or every queried relay EOSE'd —
+            // the timeout only backstops relays that never answer
+            awaitSubDone(pool, awaiting, 12_000, allResolved)
             Log.d("UserProfileVM", "followers: k0 fetch unresolved=${wanted.size} of ${uncached.size}")
         } finally {
             k0Collect.cancel()

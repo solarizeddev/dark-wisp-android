@@ -193,6 +193,14 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
     private val _eoseSignals = MutableSharedFlow<String>(extraBufferCapacity = 64)
     val eoseSignals: SharedFlow<String> = _eoseSignals
 
+    /**
+     * EOSE with the relay that sent it (subscriptionId to relayUrl) — lets a
+     * caller that knows exactly which relays it messaged complete when all of
+     * them have answered instead of guessing with fixed delays.
+     */
+    private val _eoseDetails = MutableSharedFlow<Pair<String, String>>(extraBufferCapacity = 64)
+    val eoseDetails: SharedFlow<Pair<String, String>> = _eoseDetails
+
     /** Event IDs that failed async signature verification and should be removed from UI. */
     private val _invalidEvents = MutableSharedFlow<String>(extraBufferCapacity = 64)
     val invalidEvents: SharedFlow<String> = _invalidEvents
@@ -471,6 +479,7 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
                         val elapsed = subStartTimes[msg.subscriptionId]?.let { System.currentTimeMillis() - it } ?: -1L
                         Log.d("SUBLOG", "EOSE sub=${msg.subscriptionId} relay=${relay.config.url}: $count events in ${elapsed}ms")
                         _eoseSignals.tryEmit(msg.subscriptionId)
+                        _eoseDetails.tryEmit(msg.subscriptionId to relay.config.url)
                         unsupportedCounts.remove(relay.config.url) // Relay works, clear counter
                     }
                     is RelayMessage.Ok -> {
@@ -841,9 +850,10 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
         }
     }
 
-    fun sendToAll(message: String) {
+    /** Returns the URLs of the relays the message was actually sent to. */
+    fun sendToAll(message: String): List<String> {
         val subId = extractSubId(message)
-        var sentCount = 0
+        val sentTo = mutableListOf<String>()
         for (relay in relays) {
             if (subId != null) {
                 if (!subscriptionTracker.hasCapacity(relay.config.url, subId)) continue
@@ -851,12 +861,13 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
                 trackSubscription(relay.config.url, subId, message)
             }
             relay.send(message)
-            sentCount++
+            sentTo.add(relay.config.url)
         }
         if (subId != null) {
             logSubStart(subId, message)
-            Log.d("RLC", "[Pool] sendToAll sub=$subId → $sentCount relays")
+            Log.d("RLC", "[Pool] sendToAll sub=$subId → ${sentTo.size} relays")
         }
+        return sentTo
     }
 
     /** Mark which relay URLs are the user's own pinned relays (from NIP-65). */
